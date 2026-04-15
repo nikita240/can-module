@@ -1066,7 +1066,7 @@
 		(on_board yes)
 		(dnp no)
 		(uuid "09c69062-3416-4a5e-86f5-0d16adbfacf5")
-		(property "Reference" "R9"
+		(property "Reference" "R20"
 			(at 129.54 101.6 0)
 			(effects
 				(font
@@ -1198,7 +1198,7 @@
 		(instances
 			(project "can-module"
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/09a5a7b6-fe3e-4eb4-9cde-bb28b08e6e92"
-					(reference "R24")
+					(reference "R8")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/95cdb4ae-2820-47a5-b7b5-18525147b410"
@@ -1206,11 +1206,11 @@
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b63ae371-0413-4524-b027-6b09efc1ff94"
-					(reference "R9")
+					(reference "R20")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b9c0ee24-df58-437e-92df-5944137f34d2"
-					(reference "R20")
+					(reference "R12")
 					(unit 1)
 				)
 			)
@@ -1225,7 +1225,7 @@
 		(on_board yes)
 		(dnp no)
 		(uuid "0db64bac-876c-4136-b6be-2f5c19e1c517")
-		(property "Reference" "R8"
+		(property "Reference" "R21"
 			(at 125.73 73.66 0)
 			(effects
 				(font
@@ -1357,19 +1357,19 @@
 		(instances
 			(project "can-module"
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/09a5a7b6-fe3e-4eb4-9cde-bb28b08e6e92"
-					(reference "R23")
+					(reference "R10")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/95cdb4ae-2820-47a5-b7b5-18525147b410"
-					(reference "R15")
+					(reference "R18")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b63ae371-0413-4524-b027-6b09efc1ff94"
-					(reference "R8")
+					(reference "R21")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b9c0ee24-df58-437e-92df-5944137f34d2"
-					(reference "R19")
+					(reference "R13")
 					(unit 1)
 				)
 			)
@@ -1384,7 +1384,7 @@
 		(on_board yes)
 		(dnp no)
 		(uuid "1bd81e59-3433-4782-8c2b-5a4815b8a061")
-		(property "Reference" "Q4"
+		(property "Reference" "Q12"
 			(at 114.3 91.44 0)
 			(effects
 				(font
@@ -1501,19 +1501,19 @@
 		(instances
 			(project "can-module"
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/09a5a7b6-fe3e-4eb4-9cde-bb28b08e6e92"
-					(reference "Q13")
+					(reference "Q3")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/95cdb4ae-2820-47a5-b7b5-18525147b410"
-					(reference "Q7")
+					(reference "Q9")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b63ae371-0413-4524-b027-6b09efc1ff94"
-					(reference "Q4")
+					(reference "Q12")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b9c0ee24-df58-437e-92df-5944137f34d2"
-					(reference "Q10")
+					(reference "Q5")
 					(unit 1)
 				)
 			)
@@ -1528,7 +1528,7 @@
 		(on_board yes)
 		(dnp no)
 		(uuid "7d805d43-8365-4aff-b40a-9959e3c56279")
-		(property "Reference" "Q6"
+		(property "Reference" "Q10"
 			(at 138.43 101.6 0)
 			(effects
 				(font
@@ -1645,19 +1645,19 @@
 		(instances
 			(project "can-module"
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/09a5a7b6-fe3e-4eb4-9cde-bb28b08e6e92"
-					(reference "Q15")
+					(reference "Q1")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/95cdb4ae-2820-47a5-b7b5-18525147b410"
-					(reference "Q9")
+					(reference "Q7")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b63ae371-0413-4524-b027-6b09efc1ff94"
-					(reference "Q6")
+					(reference "Q10")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b9c0ee24-df58-437e-92df-5944137f34d2"
-					(reference "Q12")
+					(reference "Q4")
 					(unit 1)
 				)
 			)
@@ -1672,7 +1672,7 @@
 		(on_board yes)
 		(dnp no)
 		(uuid "8bdaaccb-d216-40f4-86e6-1164e72163d5")
-		(property "Reference" "R7"
+		(property "Reference" "R24"
 			(at 96.266 87.63 0)
 			(effects
 				(font
@@ -1804,19 +1804,19 @@
 		(instances
 			(project "can-module"
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/09a5a7b6-fe3e-4eb4-9cde-bb28b08e6e92"
-					(reference "R21")
+					(reference "R11")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/95cdb4ae-2820-47a5-b7b5-18525147b410"
-					(reference "R10")
+					(reference "R19")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b63ae371-0413-4524-b027-6b09efc1ff94"
-					(reference "R7")
+					(reference "R24")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b9c0ee24-df58-437e-92df-5944137f34d2"
-					(reference "R17")
+					(reference "R15")
 					(unit 1)
 				)
 			)
@@ -1907,7 +1907,7 @@
 		(on_board yes)
 		(dnp no)
 		(uuid "d471afa5-56c7-4414-a340-8a9b0f3c7bae")
-		(property "Reference" "Q5"
+		(property "Reference" "Q11"
 			(at 138.43 78.74 0)
 			(effects
 				(font
@@ -2024,7 +2024,7 @@
 		(instances
 			(project "can-module"
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/09a5a7b6-fe3e-4eb4-9cde-bb28b08e6e92"
-					(reference "Q14")
+					(reference "Q2")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/95cdb4ae-2820-47a5-b7b5-18525147b410"
@@ -2032,11 +2032,11 @@
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b63ae371-0413-4524-b027-6b09efc1ff94"
-					(reference "Q5")
+					(reference "Q11")
 					(unit 1)
 				)
 				(path "/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/b9c0ee24-df58-437e-92df-5944137f34d2"
-					(reference "Q11")
+					(reference "Q6")
 					(unit 1)
 				)
 			)

@@ -31,3 +31,5 @@ jlcpcb
 jlcpcb/*
 
 *_old
+
+.log
