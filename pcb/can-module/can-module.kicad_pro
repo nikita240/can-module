@@ -58,32 +58,7 @@
           "width": 0.0
         }
       ],
-      "drc_exclusions": [
-        [
-          "copper_edge_clearance|66880000|68250000|b046453c-6808-4398-8823-df53a2766c23|f407e4be-149e-4362-9b29-e16dad32873a",
-          "Inteional LED stick-out"
-        ],
-        [
-          "copper_edge_clearance|66880000|69650000|b046453c-6808-4398-8823-df53a2766c23|fd5dd975-d8e5-4db1-b529-5df1dfcc6f3d",
-          "Inteional LED stick-out"
-        ],
-        [
-          "hole_clearance|74200000|65505000|8a92f7c8-a4fc-427d-bafa-4dc975e2af60|25ea375c-6b5e-4a4b-bd58-dc275f7669ed",
-          "Part of footprint design"
-        ],
-        [
-          "hole_clearance|74200000|65505000|8a92f7c8-a4fc-427d-bafa-4dc975e2af60|b07191ea-8cab-4dc4-88a6-ee334c00ecb0",
-          "Part of footprint design"
-        ],
-        [
-          "hole_clearance|80300000|65505000|386bd7e7-26ea-4dc1-8694-e6e35325133e|55b10146-6135-4032-a987-0f74b0501214",
-          "Part of footprint design"
-        ],
-        [
-          "hole_clearance|80300000|65505000|386bd7e7-26ea-4dc1-8694-e6e35325133e|ef9ecbe7-7bb6-4504-9845-60b04760e529",
-          "Part of footprint design"
-        ]
-      ],
+      "drc_exclusions": [],
       "meta": {
         "filename": "board_design_settings.json",
         "version": 2
@@ -278,7 +253,28 @@
     "equivalence_files": []
   },
   "erc": {
-    "erc_exclusions": [],
+    "erc_exclusions": [
+      [
+        "pin_to_pin|1333500|609600|38753485-82ab-466b-a90b-fa3280cc87f6|8cd08bbd-4b3b-445b-beeb-9a8d578c42c4|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a",
+        ""
+      ],
+      [
+        "pin_to_pin|1333500|762000|8e8f880e-c709-4109-8ab9-c3117a14dd3e|288fe8f8-7429-46eb-8262-d71766d3e109|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a",
+        ""
+      ],
+      [
+        "pin_to_pin|1384300|609600|288fe8f8-7429-46eb-8262-d71766d3e109|3375dc91-b749-47fc-9eb6-9c343e68ad32|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a",
+        ""
+      ],
+      [
+        "pin_to_pin|1384300|762000|15852d01-e50b-4f59-8f97-0ef152947589|2b9f0ba1-9eab-45d7-8ca1-e222ef7590d7|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a",
+        ""
+      ],
+      [
+        "pin_to_pin|927100|1219200|2cf7a834-3382-4571-b20b-e96a0f2b357b|228ab4c8-14e2-468a-9aa3-47b789611733|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a|/8c0b3d8b-46d3-4173-ab1e-a61765f77d61/43274a1c-f068-4227-8d4c-f55bb0b2e49a",
+        ""
+      ]
+    ],
     "meta": {
       "version": 0
     },
