@@ -7,7 +7,7 @@ use ads1x1x::Ads1x1x;
 use defmt::info;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
 use embassy_executor::Spawner;
-use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+use embassy_rp::pwm::{self, Config as PwmConfig, Pwm, SetDutyCycle};
 use embassy_rp::{
     bind_interrupts,
     gpio::{Input, Level, Output, Pull},
@@ -16,7 +16,7 @@ use embassy_rp::{
     spi::{self, Spi},
 };
 use embassy_sync::blocking_mutex::{raw::NoopRawMutex, Mutex};
-use embassy_time::Delay;
+use embassy_time::{Delay, Duration};
 use fixed::traits::ToFixed;
 use mcp2515::{CanSpeed, MCP2515, McpSpeed, Settings, regs::OpMode};
 use static_cell::StaticCell;
@@ -63,23 +63,21 @@ fn totem_pole_config(freq_hz: u32, duty_percent: f32) -> PwmConfig {
 // Entry point
 // ---------------------------------------------------------------------------
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     info!("CAN module starting");
 
     // -----------------------------------------------------------------------
     // Status LED — GPIO0
     // -----------------------------------------------------------------------
-    let _status_led = Output::new(p.PIN_0, Level::High);
+    // let _status_led = Output::new(p.PIN_0, Level::High);
+    let status_led = Pwm::new_output_a(p.PWM_SLICE0, p.PIN_0, pwm::Config::default());
 
     // -----------------------------------------------------------------------
     // I2C1 — ADS1115 16-bit ADC
     //   GPIO2 = SDA, GPIO3 = SCL, GPIO5 = ALERT/RDY
     // -----------------------------------------------------------------------
-    let mut i2c_config = i2c::Config::default();
-    i2c_config.frequency = 100_000;
-    i2c_config.scl_pullup = false;
-    i2c_config.sda_pullup = false;
+    let i2c_config = i2c::Config::default();
     let i2c = i2c::I2c::new_async(p.I2C1, p.PIN_3, p.PIN_2, Irqs, i2c_config);
 
     let _adc_alert = Input::new(p.PIN_5, Pull::Up);
@@ -120,7 +118,7 @@ async fn main(_spawner: Spawner) {
             mode: OpMode::Normal,           // normal operation after init
             can_speed: CanSpeed::Kbps500,   // 500 kbps — standard automotive
             mcp_speed: McpSpeed::MHz16,     // 16 MHz crystal on MCP25625
-            clkout_en: false,
+            clkout_en: true, // can0 CLKOUT feeds OSC1 on can1 so that they share crystal
         },
     ) {
         Ok(_) => info!("CAN0 initialized"),
@@ -169,7 +167,29 @@ async fn main(_spawner: Spawner) {
 
     info!("All peripherals initialized");
 
+    spawner.spawn(animate_status_led(status_led)).unwrap();
+
     loop {
         embassy_futures::yield_now().await;
+    }
+}
+
+#[embassy_executor::task]
+pub async fn animate_status_led(mut status_led: Pwm<'static>) {
+    const MILLIS_PER_UPDATE: i32 = 25;
+    const PULSE_DURATION_MS: i32 = 2000;
+    let max_duty = status_led.max_duty_cycle() / 100;
+    let mut duty: i32 = max_duty as i32;
+    let mut dt = MILLIS_PER_UPDATE * 2 * (max_duty as i32) / PULSE_DURATION_MS;
+
+    loop {
+        status_led.set_duty_cycle(duty as u16).unwrap();
+        embassy_time::Timer::after(Duration::from_millis(MILLIS_PER_UPDATE as u64)).await;
+
+        if duty <= 0 || duty >= max_duty as i32 {
+            dt = -dt;
+        }
+        duty += dt;
+        duty = duty.clamp(0, max_duty as i32);
     }
 }
