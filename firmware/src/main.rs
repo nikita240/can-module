@@ -3,7 +3,7 @@
 
 use core::cell::RefCell;
 
-use ads1x1x::Ads1x1x;
+use ads1x1x::{Ads1x1x, ComparatorQueue, FullScaleRange};
 use defmt::info;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
 use embassy_executor::Spawner;
@@ -26,6 +26,7 @@ use {defmt_rtt as _, panic_probe as _};
 // Type aliases
 // ---------------------------------------------------------------------------
 type Spi0Bus = Mutex<NoopRawMutex, RefCell<Spi<'static, SPI0, spi::Blocking>>>;
+type Adc = Ads1x1x<i2c::I2c<'static, I2C1, i2c::Async>, ads1x1x::ic::Ads1115, ads1x1x::ic::Resolution16Bit, ads1x1x::mode::OneShot>;
 
 // ---------------------------------------------------------------------------
 // Interrupt bindings
@@ -93,24 +94,20 @@ fn resistance_pwm_config(freq_hz: u32, duty_ppt: u16) -> PwmConfig {
     cfg
 }
 
-/// Convert effective sender resistance to PWM_LO duty in parts-per-thousand.
-///
-/// For a resistor-to-ground gauge the moving coil reads average current:
-///   I = V / (R1 + R_eff)         (continuous case)
-///   I_avg = D × V / R1           (PWM case, NMOS pulsing to GND through R1)
-/// Equating gives:
-///   D = R1 / (R1 + R_eff)        →   D_ppt = 1000 × R1 / (R1 + R_eff)
-///
-/// Pure integer math — overflow safe for any realistic gauge resistance.
-/// `r1_milliohms` and `r_eff_milliohms` are in mΩ to keep precision while staying integer
-/// (e.g. 68Ω → 68_000). Returns 0 if both are zero (safe fallback).
-fn resistance_to_duty_ppt(r1_milliohms: u32, r_eff_milliohms: u32) -> u16 {
-    let denom = r1_milliohms + r_eff_milliohms;
-    if denom == 0 {
-        return 0;
-    }
-    let d = 1000u64 * r1_milliohms as u64 / denom as u64;
-    d.min(1000) as u16
+
+/// Quadratic fit of empirical gauge calibration data:
+///   duty_ppt = (3·pct² + 200·pct + 47500) / 100
+fn gauge_pct_to_duty_ppt(pct: u32) -> u16 {
+    // Duty -> Gauge table
+    // 475 -> 0%
+    // 540 -> 25%
+    // 650 -> 50%
+    // 830 -> 75%
+    // 975 -> 100%
+
+    let pct = pct.min(100);
+    let duty = (3 * pct * pct + 200 * pct + 47_500) / 100;
+    duty.min(1000) as u16
 }
 
 // ---------------------------------------------------------------------------
@@ -134,14 +131,17 @@ async fn main(spawner: Spawner) {
     let i2c_config = i2c::Config::default();
     let i2c = i2c::I2c::new_async(p.I2C1, p.PIN_3, p.PIN_2, Irqs, i2c_config);
 
-    let _adc_alert = Input::new(p.PIN_5, Pull::Up);
+    let adc_drdy = Input::new(p.PIN_5, Pull::Up);
 
     // ADS1115: ADDR pin to GND → default address 0x48
     let mut adc = Ads1x1x::new_ads1115(i2c, ads1x1x::TargetAddr::default());
-    match nb::block!(adc.read(ads1x1x::channel::SingleA0)) {
-        Ok(val) => info!("ADS1115 AIN0 = {}", val),
-        Err(_) => info!("ADS1115 not responding (expected before board is built)"),
-    }
+    // R1=440Ω, R2=0..68Ω → V_max = 5 × 68/508 = 0.669V → use ±1.024V PGA range
+    let _ = adc.set_full_scale_range(FullScaleRange::Within1_024V);
+    // Enable ALERT/RDY as conversion-ready pin (work around crate bug
+    // where use_alert_rdy_pin_as_ready() skips enabling the comparator).
+    let _ = adc.set_comparator_queue(ComparatorQueue::One);
+    let _ = adc.set_low_threshold_raw(0);
+    let _ = adc.set_high_threshold_raw(-32768); // 0x8000
 
     // -----------------------------------------------------------------------
     // SPI0 — shared bus for two MCP25625 CAN controllers
@@ -215,13 +215,8 @@ async fn main(spawner: Spawner) {
     const PWM_FREQ_HZ: u32 = 1000;
 
     // Totem 0 — resistance-to-ground gauge emulator.
-    //   R1 = 68 Ω   (gauge's internal sense resistor — fixed)
-    //   R2 = 0..136 Ω  (sender potentiometer range we're emulating)
-    // Resistances are in mΩ for integer-friendly math.
-    const FUEL_GAUGE_R1_MOHMS: u32 = 68_000;
-    const FUEL_GAUGE_R2_MAX_MOHMS: u32 = 136_000;
     let totem0_cfg = resistance_pwm_config(PWM_FREQ_HZ, 0);
-    let mut totem0 = Pwm::new_output_ab(p.PWM_SLICE3, p.PIN_6, p.PIN_7, totem0_cfg);
+    let totem0 = Pwm::new_output_ab(p.PWM_SLICE3, p.PIN_6, p.PIN_7, totem0_cfg);
 
     // Totems 1–3 — complementary VREF/GND drive for voltage-style gauges.
     let voltage_cfg = totem_pole_config(PWM_FREQ_HZ, 0);
@@ -232,12 +227,13 @@ async fn main(spawner: Spawner) {
     info!("All peripherals initialized — starting demo sweep");
 
     spawner.spawn(animate_status_led(status_led)).unwrap();
+    spawner.spawn(animate_fuel_gauge(totem0)).unwrap();
+    spawner.spawn(read_adc(adc, adc_drdy)).unwrap();
+}
 
-    // Demo sequence (gauge_percent: 0 = empty, 100 = full):
-    //   1. Continuous sweep 100 → 0 over 4 s
-    //   2. Hold 1 s, then ramp-and-hold through 25 → 50 → 75 → 100
-    //      (0.5 s smooth ramp between each, then 1 s hold at the new level)
-    //   3. Repeat
+#[embassy_executor::task]
+pub async fn animate_fuel_gauge(mut totem0: Pwm<'static>) {
+    const PWM_FREQ_HZ: u32 = 1000;
     const SWEEP_STEPS: u32 = 100;
     const SWEEP_DURATION_MS: u64 = 4_000;
     const SWEEP_STEP_MS: u64 = SWEEP_DURATION_MS / SWEEP_STEPS as u64;
@@ -246,19 +242,11 @@ async fn main(spawner: Spawner) {
     const RAMP_DURATION_MS: u64 = 500;
     const RAMP_STEP_MS: u64 = RAMP_DURATION_MS / RAMP_STEPS as u64;
 
-    // Map gauge fill percentage (0..=100) → effective sender resistance in mΩ.
-    // 100 % full → 0 Ω, 0 % full → R2_max (136 Ω). Pure integer math.
-    let to_r_eff_mohms = |gauge_percent: u32| -> u32 {
-        let pct = gauge_percent.min(100);
-        ((100 - pct) * FUEL_GAUGE_R2_MAX_MOHMS) / 100
-    };
-
     loop {
         // Phase 1: continuous sweep 100 → 0
         for step in 0..=SWEEP_STEPS {
             let gauge_percent = 100 - (100 * step) / SWEEP_STEPS;
-            let r_eff_mohms = to_r_eff_mohms(gauge_percent);
-            let duty_ppt = resistance_to_duty_ppt(FUEL_GAUGE_R1_MOHMS, r_eff_mohms);
+            let duty_ppt = gauge_pct_to_duty_ppt(gauge_percent);
             totem0.set_config(&resistance_pwm_config(PWM_FREQ_HZ, duty_ppt));
             Timer::after(Duration::from_millis(SWEEP_STEP_MS)).await;
         }
@@ -270,14 +258,46 @@ async fn main(spawner: Spawner) {
         for next_pct in [25u32, 50, 75, 100] {
             for step in 1..=RAMP_STEPS {
                 let pct = prev_pct + ((next_pct - prev_pct) * step) / RAMP_STEPS;
-                let r_eff_mohms = to_r_eff_mohms(pct);
-                let duty_ppt = resistance_to_duty_ppt(FUEL_GAUGE_R1_MOHMS, r_eff_mohms);
+                let duty_ppt = gauge_pct_to_duty_ppt(pct);
                 totem0.set_config(&resistance_pwm_config(PWM_FREQ_HZ, duty_ppt));
                 Timer::after(Duration::from_millis(RAMP_STEP_MS)).await;
             }
             Timer::after(Duration::from_millis(HOLD_MS)).await;
             prev_pct = next_pct;
         }
+    }
+}
+
+#[embassy_executor::task]
+pub async fn read_adc(mut adc: Adc, mut drdy: Input<'static>) {
+    // Voltage divider: V_adc = Vref × R2 / (R1 + R2)
+    // Solving for R2:  R2 = V_adc × R1 / (Vref - V_adc)
+    const R1_MOHMS: i64 = 470_000;
+    const VREF_UV: i64 = 5_000_000; // 5V in µV
+
+    loop {
+        // Trigger conversion (first call returns WouldBlock)
+        let _ = adc.read(ads1x1x::channel::SingleA0);
+        // Wait for ALERT/RDY pin to signal conversion complete
+        drdy.wait_for_falling_edge().await;
+        // Read the result (now ready)
+        let raw = match adc.read(ads1x1x::channel::SingleA0) {
+            Ok(val) => val,
+            Err(_) => {
+                info!("ADC read failed");
+                Timer::after(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        // ±1.024V FSR → 1 LSB = 1024000 µV / 32768 = 31.25 µV
+        let v_uv = raw as i64 * 125 / 4;
+        let r2_mohms = if v_uv > 0 && v_uv < VREF_UV {
+            v_uv * R1_MOHMS / (VREF_UV - v_uv)
+        } else {
+            0
+        };
+        info!("ADC: raw={}, V={}uV, R2={}mOhm", raw, v_uv, r2_mohms);
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
