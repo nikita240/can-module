@@ -16,7 +16,7 @@ use embassy_rp::{
     spi::{self, Spi},
 };
 use embassy_sync::blocking_mutex::{raw::NoopRawMutex, Mutex};
-use embassy_time::{Delay, Duration};
+use embassy_time::{Delay, Duration, Timer};
 use fixed::traits::ToFixed;
 use mcp2515::{CanSpeed, MCP2515, McpSpeed, Settings, regs::OpMode};
 use static_cell::StaticCell;
@@ -38,25 +38,79 @@ bind_interrupts!(struct Irqs {
 // Totem-pole PWM helpers
 // ---------------------------------------------------------------------------
 
-/// Build a complementary PWM config for totem-pole gauge outputs.
-///   - Channel A = PWM_HI (drives PMOS high-side via level-shifter)
-///   - Channel B = PWM_LO (drives NMOS low-side, inverted for anti-phase)
-fn totem_pole_config(freq_hz: u32, duty_percent: f32) -> PwmConfig {
-    let mut cfg = PwmConfig::default();
-
+/// Compute (divider, top) for a target PWM frequency from clk_sys.
+fn pwm_freq_params(freq_hz: u32) -> (u16, u16) {
     let clock_freq = embassy_rp::clocks::clk_sys_freq();
     let divider: u16 = (clock_freq / (freq_hz * 65535) + 1) as u16;
     let top = (clock_freq / (freq_hz * divider as u32)) as u16 - 1;
+    (divider, top)
+}
+
+/// Convert duty in parts-per-thousand (0..=1000) to the slice's compare value.
+fn duty_ppt_to_compare(duty_ppt: u16, top: u16) -> u16 {
+    let compare = (duty_ppt as u32 * (top as u32 + 1)) / 1000;
+    compare.min(top as u32 + 1) as u16
+}
+
+/// Build a complementary (VREF / GND) PWM config for totem-pole gauge outputs.
+/// Use for analog *voltage* signals (3-wire ratiometric sensors, etc).
+///   - Channel A = PWM_HI (drives PMOS high-side via level-shifter)
+///   - Channel B = PWM_LO (drives NMOS low-side, inverted for anti-phase)
+///   - duty    0 ‰ → output stuck at GND
+///   - duty 1000 ‰ → output stuck at VREF
+fn totem_pole_config(freq_hz: u32, duty_ppt: u16) -> PwmConfig {
+    let mut cfg = PwmConfig::default();
+    let (divider, top) = pwm_freq_params(freq_hz);
 
     cfg.divider = divider.to_fixed();
     cfg.top = top;
     cfg.invert_a = false;
     cfg.invert_b = true;
 
-    let compare = ((duty_percent / 100.0) * (top as f32 + 1.0)) as u16;
+    let compare = duty_ppt_to_compare(duty_ppt, top);
     cfg.compare_a = compare;
     cfg.compare_b = compare;
     cfg
+}
+
+/// Build a NMOS-only (GND / Open) PWM config for resistance-to-ground gauges
+/// (fuel sender, oil pressure sender, coolant temp sender, etc).
+///   - Channel A = PWM_HI: pinned LOW so the PMOS stays OFF (no VREF on output)
+///   - Channel B = PWM_LO: drives NMOS directly
+///   - duty    0 ‰ → NMOS always off → pin floating (R_eff = ∞)
+///   - duty 1000 ‰ → NMOS always on  → pin grounded (R_eff = 0)
+fn resistance_pwm_config(freq_hz: u32, duty_ppt: u16) -> PwmConfig {
+    let mut cfg = PwmConfig::default();
+    let (divider, top) = pwm_freq_params(freq_hz);
+
+    cfg.divider = divider.to_fixed();
+    cfg.top = top;
+    cfg.invert_a = false;
+    cfg.invert_b = false;
+
+    cfg.compare_a = 0; // PWM_HI always LOW → level shifter off → PMOS off
+    cfg.compare_b = duty_ppt_to_compare(duty_ppt, top);
+    cfg
+}
+
+/// Convert effective sender resistance to PWM_LO duty in parts-per-thousand.
+///
+/// For a resistor-to-ground gauge the moving coil reads average current:
+///   I = V / (R1 + R_eff)         (continuous case)
+///   I_avg = D × V / R1           (PWM case, NMOS pulsing to GND through R1)
+/// Equating gives:
+///   D = R1 / (R1 + R_eff)        →   D_ppt = 1000 × R1 / (R1 + R_eff)
+///
+/// Pure integer math — overflow safe for any realistic gauge resistance.
+/// `r1_milliohms` and `r_eff_milliohms` are in mΩ to keep precision while staying integer
+/// (e.g. 68Ω → 68_000). Returns 0 if both are zero (safe fallback).
+fn resistance_to_duty_ppt(r1_milliohms: u32, r_eff_milliohms: u32) -> u16 {
+    let denom = r1_milliohms + r_eff_milliohms;
+    if denom == 0 {
+        return 0;
+    }
+    let d = 1000u64 * r1_milliohms as u64 / denom as u64;
+    d.min(1000) as u16
 }
 
 // ---------------------------------------------------------------------------
@@ -151,26 +205,79 @@ async fn main(spawner: Spawner) {
     }
 
     // -----------------------------------------------------------------------
-    // Totem-pole PWM outputs — 4 channels, complementary A/B pairs
+    // Totem-pole PWM outputs — 4 channels
     //
-    // Slice 3: GPIO6 /GPIO7   → Totem 0
-    // Slice 4: GPIO8 /GPIO9   → Totem 1
-    // Slice 5: GPIO10/GPIO11  → Totem 2
-    // Slice 6: GPIO12/GPIO13  → Totem 3
+    // Slice 3: GPIO6 /GPIO7   → Totem 0  (resistance emulation, NMOS-only)
+    // Slice 4: GPIO8 /GPIO9   → Totem 1  (complementary VREF/GND)
+    // Slice 5: GPIO10/GPIO11  → Totem 2  (complementary VREF/GND)
+    // Slice 6: GPIO12/GPIO13  → Totem 3  (complementary VREF/GND)
     // -----------------------------------------------------------------------
-    let gauge_cfg = totem_pole_config(200, 0.0);
+    const PWM_FREQ_HZ: u32 = 1000;
 
-    let _totem0 = Pwm::new_output_ab(p.PWM_SLICE3, p.PIN_6, p.PIN_7, gauge_cfg.clone());
-    let _totem1 = Pwm::new_output_ab(p.PWM_SLICE4, p.PIN_8, p.PIN_9, gauge_cfg.clone());
-    let _totem2 = Pwm::new_output_ab(p.PWM_SLICE5, p.PIN_10, p.PIN_11, gauge_cfg.clone());
-    let _totem3 = Pwm::new_output_ab(p.PWM_SLICE6, p.PIN_12, p.PIN_13, gauge_cfg);
+    // Totem 0 — resistance-to-ground gauge emulator.
+    //   R1 = 68 Ω   (gauge's internal sense resistor — fixed)
+    //   R2 = 0..136 Ω  (sender potentiometer range we're emulating)
+    // Resistances are in mΩ for integer-friendly math.
+    const FUEL_GAUGE_R1_MOHMS: u32 = 68_000;
+    const FUEL_GAUGE_R2_MAX_MOHMS: u32 = 136_000;
+    let totem0_cfg = resistance_pwm_config(PWM_FREQ_HZ, 0);
+    let mut totem0 = Pwm::new_output_ab(p.PWM_SLICE3, p.PIN_6, p.PIN_7, totem0_cfg);
 
-    info!("All peripherals initialized");
+    // Totems 1–3 — complementary VREF/GND drive for voltage-style gauges.
+    let voltage_cfg = totem_pole_config(PWM_FREQ_HZ, 0);
+    let _totem1 = Pwm::new_output_ab(p.PWM_SLICE4, p.PIN_8, p.PIN_9, voltage_cfg.clone());
+    let _totem2 = Pwm::new_output_ab(p.PWM_SLICE5, p.PIN_10, p.PIN_11, voltage_cfg.clone());
+    let _totem3 = Pwm::new_output_ab(p.PWM_SLICE6, p.PIN_12, p.PIN_13, voltage_cfg);
+
+    info!("All peripherals initialized — starting demo sweep");
 
     spawner.spawn(animate_status_led(status_led)).unwrap();
 
+    // Demo sequence (gauge_percent: 0 = empty, 100 = full):
+    //   1. Continuous sweep 100 → 0 over 4 s
+    //   2. Hold 1 s, then ramp-and-hold through 25 → 50 → 75 → 100
+    //      (0.5 s smooth ramp between each, then 1 s hold at the new level)
+    //   3. Repeat
+    const SWEEP_STEPS: u32 = 100;
+    const SWEEP_DURATION_MS: u64 = 4_000;
+    const SWEEP_STEP_MS: u64 = SWEEP_DURATION_MS / SWEEP_STEPS as u64;
+    const HOLD_MS: u64 = 1_000;
+    const RAMP_STEPS: u32 = 25;
+    const RAMP_DURATION_MS: u64 = 500;
+    const RAMP_STEP_MS: u64 = RAMP_DURATION_MS / RAMP_STEPS as u64;
+
+    // Map gauge fill percentage (0..=100) → effective sender resistance in mΩ.
+    // 100 % full → 0 Ω, 0 % full → R2_max (136 Ω). Pure integer math.
+    let to_r_eff_mohms = |gauge_percent: u32| -> u32 {
+        let pct = gauge_percent.min(100);
+        ((100 - pct) * FUEL_GAUGE_R2_MAX_MOHMS) / 100
+    };
+
     loop {
-        embassy_futures::yield_now().await;
+        // Phase 1: continuous sweep 100 → 0
+        for step in 0..=SWEEP_STEPS {
+            let gauge_percent = 100 - (100 * step) / SWEEP_STEPS;
+            let r_eff_mohms = to_r_eff_mohms(gauge_percent);
+            let duty_ppt = resistance_to_duty_ppt(FUEL_GAUGE_R1_MOHMS, r_eff_mohms);
+            totem0.set_config(&resistance_pwm_config(PWM_FREQ_HZ, duty_ppt));
+            Timer::after(Duration::from_millis(SWEEP_STEP_MS)).await;
+        }
+
+        // Phase 2: hold at 0 % for 1 s, then ramp-and-hold through 25 → 50 → 75 → 100
+        // (smooth 0.5 s interpolation between each level, then 1 s hold)
+        Timer::after(Duration::from_millis(HOLD_MS)).await;
+        let mut prev_pct: u32 = 0;
+        for next_pct in [25u32, 50, 75, 100] {
+            for step in 1..=RAMP_STEPS {
+                let pct = prev_pct + ((next_pct - prev_pct) * step) / RAMP_STEPS;
+                let r_eff_mohms = to_r_eff_mohms(pct);
+                let duty_ppt = resistance_to_duty_ppt(FUEL_GAUGE_R1_MOHMS, r_eff_mohms);
+                totem0.set_config(&resistance_pwm_config(PWM_FREQ_HZ, duty_ppt));
+                Timer::after(Duration::from_millis(RAMP_STEP_MS)).await;
+            }
+            Timer::after(Duration::from_millis(HOLD_MS)).await;
+            prev_pct = next_pct;
+        }
     }
 }
 
