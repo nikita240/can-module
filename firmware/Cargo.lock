@@ -49,6 +49,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "assign-resources"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "840ad5d907de7448d88a3f22b4a7b5d326c6eb3deeb9f94cfaaec7354a80b305"
+
+[[package]]
 name = "atomic-polyfill"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -149,6 +155,7 @@ name = "can-module"
 version = "0.1.0"
 dependencies = [
  "ads1x1x",
+ "assign-resources",
  "byte-slice-cast",
  "cortex-m",
  "cortex-m-rt",

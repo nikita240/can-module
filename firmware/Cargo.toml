@@ -64,3 +64,4 @@ mcp2515 = { version = "0.3.0", features = ["defmt"] }
 # 16-bit ADC (ADS1115 on I2C)
 ads1x1x = "0.3.0"
 nb = "1.1.0"
+assign-resources = "0.5"

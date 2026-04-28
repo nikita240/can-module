@@ -4,18 +4,20 @@
 use core::cell::RefCell;
 
 use ads1x1x::{Ads1x1x, ComparatorQueue, FullScaleRange};
+use assign_resources::assign_resources;
 use defmt::info;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
 use embassy_executor::Spawner;
+use embassy_futures::yield_now;
 use embassy_rp::pwm::{self, Config as PwmConfig, Pwm, SetDutyCycle};
 use embassy_rp::{
-    bind_interrupts,
+    Peri, bind_interrupts,
     gpio::{Input, Level, Output, Pull},
     i2c::{self, InterruptHandler as I2cInterruptHandler},
-    peripherals::{I2C1, SPI0},
+    peripherals::{self, I2C1, SPI0},
     spi::{self, Spi},
 };
-use embassy_sync::blocking_mutex::{raw::NoopRawMutex, Mutex};
+use embassy_sync::blocking_mutex::{Mutex, raw::NoopRawMutex};
 use embassy_time::{Delay, Duration, Timer};
 use fixed::traits::ToFixed;
 use mcp2515::{CanSpeed, MCP2515, McpSpeed, Settings, regs::OpMode};
@@ -23,10 +25,61 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 // ---------------------------------------------------------------------------
+// Resource assignments
+// ---------------------------------------------------------------------------
+assign_resources! {
+    status_led: StatusLedResources {
+        pwm: PWM_SLICE0,
+        pin: PIN_0,
+    },
+    adc: AdcResources {
+        i2c: I2C1,
+        sda: PIN_2,
+        scl: PIN_3,
+        drdy: PIN_5,
+    },
+    can_bus: CanBusResources {
+        spi: SPI0,
+        sck: PIN_18,
+        mosi: PIN_19,
+        miso: PIN_20,
+        can0_cs: PIN_14,
+        can0_int: PIN_15,
+        can0_stby: PIN_16,
+        can0_reset: PIN_17,
+        can1_cs: PIN_21,
+        can1_int: PIN_22,
+        can1_stby: PIN_23,
+        can1_reset: PIN_24,
+    },
+    fuel_gauge: FuelGaugeResources {
+        pwm: PWM_SLICE3,
+        hi: PIN_6,
+        lo: PIN_7,
+    },
+    voltage_gauges: VoltageGaugeResources {
+        pwm1: PWM_SLICE4,
+        hi1: PIN_8,
+        lo1: PIN_9,
+        pwm2: PWM_SLICE5,
+        hi2: PIN_10,
+        lo2: PIN_11,
+        pwm3: PWM_SLICE6,
+        hi3: PIN_12,
+        lo3: PIN_13,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
 type Spi0Bus = Mutex<NoopRawMutex, RefCell<Spi<'static, SPI0, spi::Blocking>>>;
-type Adc = Ads1x1x<i2c::I2c<'static, I2C1, i2c::Async>, ads1x1x::ic::Ads1115, ads1x1x::ic::Resolution16Bit, ads1x1x::mode::OneShot>;
+type Adc = Ads1x1x<
+    i2c::I2c<'static, I2C1, i2c::Async>,
+    ads1x1x::ic::Ads1115,
+    ads1x1x::ic::Resolution16Bit,
+    ads1x1x::mode::OneShot,
+>;
 
 // ---------------------------------------------------------------------------
 // Interrupt bindings
@@ -94,7 +147,6 @@ fn resistance_pwm_config(freq_hz: u32, duty_ppt: u16) -> PwmConfig {
     cfg
 }
 
-
 /// Quadratic fit of empirical gauge calibration data:
 ///   duty_ppt = (3·pct² + 200·pct + 47500) / 100
 fn gauge_pct_to_duty_ppt(pct: u32) -> u16 {
@@ -116,124 +168,100 @@ fn gauge_pct_to_duty_ppt(pct: u32) -> u16 {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    let r = split_resources!(p);
+
     info!("CAN module starting");
 
-    // -----------------------------------------------------------------------
-    // Status LED — GPIO0
-    // -----------------------------------------------------------------------
-    // let _status_led = Output::new(p.PIN_0, Level::High);
-    let status_led = Pwm::new_output_a(p.PWM_SLICE0, p.PIN_0, pwm::Config::default());
+    spawner.spawn(animate_status_led(r.status_led)).unwrap();
+    spawner.spawn(read_loop(r.adc)).unwrap();
+    spawner.spawn(animate_fuel_gauge(r.fuel_gauge)).unwrap();
+    spawner.spawn(init_can(r.can_bus)).unwrap();
+    spawner
+        .spawn(init_voltage_gauges(r.voltage_gauges))
+        .unwrap();
+}
 
-    // -----------------------------------------------------------------------
-    // I2C1 — ADS1115 16-bit ADC
-    //   GPIO2 = SDA, GPIO3 = SCL, GPIO5 = ALERT/RDY
-    // -----------------------------------------------------------------------
-    let i2c_config = i2c::Config::default();
-    let i2c = i2c::I2c::new_async(p.I2C1, p.PIN_3, p.PIN_2, Irqs, i2c_config);
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
 
-    let adc_drdy = Input::new(p.PIN_5, Pull::Up);
+#[embassy_executor::task]
+async fn animate_status_led(r: StatusLedResources) {
+    let mut status_led = Pwm::new_output_a(r.pwm, r.pin, pwm::Config::default());
 
-    // ADS1115: ADDR pin to GND → default address 0x48
-    let mut adc = Ads1x1x::new_ads1115(i2c, ads1x1x::TargetAddr::default());
-    // R1=440Ω, R2=0..68Ω → V_max = 5 × 68/508 = 0.669V → use ±1.024V PGA range
-    let _ = adc.set_full_scale_range(FullScaleRange::Within1_024V);
-    // Enable ALERT/RDY as conversion-ready pin (work around crate bug
-    // where use_alert_rdy_pin_as_ready() skips enabling the comparator).
-    let _ = adc.set_comparator_queue(ComparatorQueue::One);
-    let _ = adc.set_low_threshold_raw(0);
-    let _ = adc.set_high_threshold_raw(-32768); // 0x8000
+    const MILLIS_PER_UPDATE: i32 = 25;
+    const PULSE_DURATION_MS: i32 = 2000;
+    let max_duty = status_led.max_duty_cycle() / 100;
+    let mut duty: i32 = max_duty as i32;
+    let mut dt = MILLIS_PER_UPDATE * 2 * (max_duty as i32) / PULSE_DURATION_MS;
 
-    // -----------------------------------------------------------------------
-    // SPI0 — shared bus for two MCP25625 CAN controllers
-    //   GPIO18 = SCK, GPIO19 = MOSI, GPIO20 = MISO
-    // -----------------------------------------------------------------------
-    let mut spi_config = spi::Config::default();
-    spi_config.frequency = 2_000_000;
-    let spi = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_20, spi_config);
-    static SPI_BUS: StaticCell<Spi0Bus> = StaticCell::new();
-    let spi_bus = SPI_BUS.init(Mutex::new(spi.into()));
+    loop {
+        status_led.set_duty_cycle(duty as u16).unwrap();
+        Timer::after(Duration::from_millis(MILLIS_PER_UPDATE as u64)).await;
 
-    // -----------------------------------------------------------------------
-    // CAN 0 — MCP25625 on SPI0
-    //   GPIO14=CS, GPIO15=INT, GPIO16=STBY, GPIO17=RESET
-    // -----------------------------------------------------------------------
-    let can0_cs = Output::new(p.PIN_14, Level::High);
-    let _can0_int = Input::new(p.PIN_15, Pull::Up);
-    let _can0_stby = Output::new(p.PIN_16, Level::Low);
-    let mut can0_reset = Output::new(p.PIN_17, Level::Low);
-    can0_reset.set_high();
-
-    let can0_spi = SpiDevice::new(spi_bus, can0_cs);
-    let mut can0 = MCP2515::new(can0_spi);
-    let mut delay = Delay;
-    match can0.init(
-        &mut delay,
-        Settings {
-            mode: OpMode::Normal,           // normal operation after init
-            can_speed: CanSpeed::Kbps500,   // 500 kbps — standard automotive
-            mcp_speed: McpSpeed::MHz16,     // 16 MHz crystal on MCP25625
-            clkout_en: true, // can0 CLKOUT feeds OSC1 on can1 so that they share crystal
-        },
-    ) {
-        Ok(_) => info!("CAN0 initialized"),
-        Err(_) => info!("CAN0 init failed (expected before board is built)"),
+        if duty <= 0 || duty >= max_duty as i32 {
+            dt = -dt;
+        }
+        duty += dt;
+        duty = duty.clamp(0, max_duty as i32);
     }
-
-    // -----------------------------------------------------------------------
-    // CAN 1 — MCP25625 on SPI0
-    //   GPIO21=CS, GPIO22=INT, GPIO23=STBY, GPIO24=RESET
-    // -----------------------------------------------------------------------
-    let can1_cs = Output::new(p.PIN_21, Level::High);
-    let _can1_int = Input::new(p.PIN_22, Pull::Up);
-    let _can1_stby = Output::new(p.PIN_23, Level::Low);
-    let mut can1_reset = Output::new(p.PIN_24, Level::Low);
-    can1_reset.set_high();
-
-    let can1_spi = SpiDevice::new(spi_bus, can1_cs);
-    let mut can1 = MCP2515::new(can1_spi);
-    match can1.init(
-        &mut delay,
-        Settings {
-            mode: OpMode::Normal,
-            can_speed: CanSpeed::Kbps500,
-            mcp_speed: McpSpeed::MHz16,
-            clkout_en: false,
-        },
-    ) {
-        Ok(_) => info!("CAN1 initialized"),
-        Err(_) => info!("CAN1 init failed (expected before board is built)"),
-    }
-
-    // -----------------------------------------------------------------------
-    // Totem-pole PWM outputs — 4 channels
-    //
-    // Slice 3: GPIO6 /GPIO7   → Totem 0  (resistance emulation, NMOS-only)
-    // Slice 4: GPIO8 /GPIO9   → Totem 1  (complementary VREF/GND)
-    // Slice 5: GPIO10/GPIO11  → Totem 2  (complementary VREF/GND)
-    // Slice 6: GPIO12/GPIO13  → Totem 3  (complementary VREF/GND)
-    // -----------------------------------------------------------------------
-    const PWM_FREQ_HZ: u32 = 1000;
-
-    // Totem 0 — resistance-to-ground gauge emulator.
-    let totem0_cfg = resistance_pwm_config(PWM_FREQ_HZ, 0);
-    let totem0 = Pwm::new_output_ab(p.PWM_SLICE3, p.PIN_6, p.PIN_7, totem0_cfg);
-
-    // Totems 1–3 — complementary VREF/GND drive for voltage-style gauges.
-    let voltage_cfg = totem_pole_config(PWM_FREQ_HZ, 0);
-    let _totem1 = Pwm::new_output_ab(p.PWM_SLICE4, p.PIN_8, p.PIN_9, voltage_cfg.clone());
-    let _totem2 = Pwm::new_output_ab(p.PWM_SLICE5, p.PIN_10, p.PIN_11, voltage_cfg.clone());
-    let _totem3 = Pwm::new_output_ab(p.PWM_SLICE6, p.PIN_12, p.PIN_13, voltage_cfg);
-
-    info!("All peripherals initialized — starting demo sweep");
-
-    spawner.spawn(animate_status_led(status_led)).unwrap();
-    spawner.spawn(animate_fuel_gauge(totem0)).unwrap();
-    spawner.spawn(read_adc(adc, adc_drdy)).unwrap();
 }
 
 #[embassy_executor::task]
-pub async fn animate_fuel_gauge(mut totem0: Pwm<'static>) {
+async fn read_loop(r: AdcResources) {
+    let i2c = i2c::I2c::new_async(r.i2c, r.scl, r.sda, Irqs, i2c::Config::default());
+    let mut drdy = Input::new(r.drdy, Pull::Up);
+
+    let mut adc = Ads1x1x::new_ads1115(i2c, ads1x1x::TargetAddr::default());
+    // R1=470Ω, R2=0..68Ω → V_max = 5 × 68/538 = 0.620V → use ±1.024V PGA range
+    let _ = adc.set_full_scale_range(FullScaleRange::Within1_024V);
+    // Enable ALERT/RDY as conversion-ready pin.
+    // use_alert_rdy_pin_as_ready() sets the thresholds but skips enabling the
+    // comparator from default config (crate bug), so enable it after.
+    let _ = adc.use_alert_rdy_pin_as_ready();
+    let _ = adc.set_comparator_queue(ComparatorQueue::One);
+
+    // Voltage divider: V_adc = Vref × R2 / (R1 + R2)
+    // Solving for R2:  R2 = V_adc × R1 / (Vref - V_adc)
+    const R1_MOHMS: i64 = 470_000;
+    const VREF_UV: i64 = 5_000_000; // 5V in µV
+
+    loop {
+        let v_uv = read_adc(&mut adc, &mut drdy, || ads1x1x::channel::SingleA0)
+            .await
+            .unwrap();
+        let r2_mohms = v_uv * R1_MOHMS / (VREF_UV - v_uv);
+        info!("ADC: V={}uV, R2={}mOhm", v_uv, r2_mohms);
+        // Timer::after(Duration::from_millis(500)).await;
+        yield_now().await;
+    }
+}
+
+async fn read_adc<CH: ads1x1x::ChannelId<Adc>>(
+    adc: &mut Adc,
+    drdy: &mut Input<'_>,
+    mut ch: impl FnMut() -> CH,
+) -> Result<i64, ads1x1x::Error<embassy_rp::i2c::Error>> {
+    loop {
+        match adc.read(ch()) {
+            Err(nb::Error::WouldBlock) => {
+                drdy.wait_for_falling_edge().await;
+            }
+            Ok(raw) => {
+                // ±1.024V FSR → 1 LSB = 1024000 µV / 32768 = 31.25 µV
+                let v_uv = raw as i64 * 125 / 4;
+                return Ok(v_uv);
+            }
+            Err(nb::Error::Other(e)) => return Err(e),
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn animate_fuel_gauge(r: FuelGaugeResources) {
     const PWM_FREQ_HZ: u32 = 1000;
+    let mut totem0 = Pwm::new_output_ab(r.pwm, r.hi, r.lo, resistance_pwm_config(PWM_FREQ_HZ, 0));
+
     const SWEEP_STEPS: u32 = 100;
     const SWEEP_DURATION_MS: u64 = 4_000;
     const SWEEP_STEP_MS: u64 = SWEEP_DURATION_MS / SWEEP_STEPS as u64;
@@ -269,54 +297,64 @@ pub async fn animate_fuel_gauge(mut totem0: Pwm<'static>) {
 }
 
 #[embassy_executor::task]
-pub async fn read_adc(mut adc: Adc, mut drdy: Input<'static>) {
-    // Voltage divider: V_adc = Vref × R2 / (R1 + R2)
-    // Solving for R2:  R2 = V_adc × R1 / (Vref - V_adc)
-    const R1_MOHMS: i64 = 470_000;
-    const VREF_UV: i64 = 5_000_000; // 5V in µV
+async fn init_can(r: CanBusResources) {
+    let mut spi_config = spi::Config::default();
+    spi_config.frequency = 2_000_000;
+    let spi = Spi::new_blocking(r.spi, r.sck, r.mosi, r.miso, spi_config);
+    static SPI_BUS: StaticCell<Spi0Bus> = StaticCell::new();
+    let spi_bus = SPI_BUS.init(Mutex::new(spi.into()));
 
-    loop {
-        // Trigger conversion (first call returns WouldBlock)
-        let _ = adc.read(ads1x1x::channel::SingleA0);
-        // Wait for ALERT/RDY pin to signal conversion complete
-        drdy.wait_for_falling_edge().await;
-        // Read the result (now ready)
-        let raw = match adc.read(ads1x1x::channel::SingleA0) {
-            Ok(val) => val,
-            Err(_) => {
-                info!("ADC read failed");
-                Timer::after(Duration::from_millis(500)).await;
-                continue;
-            }
-        };
-        // ±1.024V FSR → 1 LSB = 1024000 µV / 32768 = 31.25 µV
-        let v_uv = raw as i64 * 125 / 4;
-        let r2_mohms = if v_uv > 0 && v_uv < VREF_UV {
-            v_uv * R1_MOHMS / (VREF_UV - v_uv)
-        } else {
-            0
-        };
-        info!("ADC: raw={}, V={}uV, R2={}mOhm", raw, v_uv, r2_mohms);
-        Timer::after(Duration::from_millis(500)).await;
+    // CAN 0
+    let can0_cs = Output::new(r.can0_cs, Level::High);
+    let _can0_int = Input::new(r.can0_int, Pull::Up);
+    let _can0_stby = Output::new(r.can0_stby, Level::Low);
+    let mut can0_reset = Output::new(r.can0_reset, Level::Low);
+    can0_reset.set_high();
+
+    let can0_spi = SpiDevice::new(spi_bus, can0_cs);
+    let mut can0 = MCP2515::new(can0_spi);
+    let mut delay = Delay;
+    match can0.init(
+        &mut delay,
+        Settings {
+            mode: OpMode::Normal,
+            can_speed: CanSpeed::Kbps500,
+            mcp_speed: McpSpeed::MHz16,
+            clkout_en: true, // can0 CLKOUT feeds OSC1 on can1 so that they share crystal
+        },
+    ) {
+        Ok(_) => info!("CAN0 initialized"),
+        Err(_) => info!("CAN0 init failed (expected before board is built)"),
+    }
+
+    // CAN 1
+    let can1_cs = Output::new(r.can1_cs, Level::High);
+    let _can1_int = Input::new(r.can1_int, Pull::Up);
+    let _can1_stby = Output::new(r.can1_stby, Level::Low);
+    let mut can1_reset = Output::new(r.can1_reset, Level::Low);
+    can1_reset.set_high();
+
+    let can1_spi = SpiDevice::new(spi_bus, can1_cs);
+    let mut can1 = MCP2515::new(can1_spi);
+    match can1.init(
+        &mut delay,
+        Settings {
+            mode: OpMode::Normal,
+            can_speed: CanSpeed::Kbps500,
+            mcp_speed: McpSpeed::MHz16,
+            clkout_en: false,
+        },
+    ) {
+        Ok(_) => info!("CAN1 initialized"),
+        Err(_) => info!("CAN1 init failed (expected before board is built)"),
     }
 }
 
 #[embassy_executor::task]
-pub async fn animate_status_led(mut status_led: Pwm<'static>) {
-    const MILLIS_PER_UPDATE: i32 = 25;
-    const PULSE_DURATION_MS: i32 = 2000;
-    let max_duty = status_led.max_duty_cycle() / 100;
-    let mut duty: i32 = max_duty as i32;
-    let mut dt = MILLIS_PER_UPDATE * 2 * (max_duty as i32) / PULSE_DURATION_MS;
-
-    loop {
-        status_led.set_duty_cycle(duty as u16).unwrap();
-        embassy_time::Timer::after(Duration::from_millis(MILLIS_PER_UPDATE as u64)).await;
-
-        if duty <= 0 || duty >= max_duty as i32 {
-            dt = -dt;
-        }
-        duty += dt;
-        duty = duty.clamp(0, max_duty as i32);
-    }
+async fn init_voltage_gauges(r: VoltageGaugeResources) {
+    const PWM_FREQ_HZ: u32 = 1000;
+    let voltage_cfg = totem_pole_config(PWM_FREQ_HZ, 0);
+    let _totem1 = Pwm::new_output_ab(r.pwm1, r.hi1, r.lo1, voltage_cfg.clone());
+    let _totem2 = Pwm::new_output_ab(r.pwm2, r.hi2, r.lo2, voltage_cfg.clone());
+    let _totem3 = Pwm::new_output_ab(r.pwm3, r.hi3, r.lo3, voltage_cfg);
 }
