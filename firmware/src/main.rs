@@ -8,7 +8,6 @@ use assign_resources::assign_resources;
 use defmt::info;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice;
 use embassy_executor::Spawner;
-use embassy_futures::yield_now;
 use embassy_rp::pwm::{self, Config as PwmConfig, Pwm, SetDutyCycle};
 use embassy_rp::{
     Peri, bind_interrupts,
@@ -147,18 +146,19 @@ fn resistance_pwm_config(freq_hz: u32, duty_ppt: u16) -> PwmConfig {
     cfg
 }
 
-/// Quadratic fit of empirical gauge calibration data:
-///   duty_ppt = (3·pct² + 200·pct + 47500) / 100
-fn gauge_pct_to_duty_ppt(pct: u32) -> u16 {
-    // Duty -> Gauge table
-    // 475 -> 0%
-    // 540 -> 25%
-    // 650 -> 50%
-    // 830 -> 75%
-    // 975 -> 100%
+/// Quadratic fit of empirical gauge calibration data. Input is gauge fill in
+/// per-mille (0..=1000) for resolution; output is PWM duty in per-mille.
+///   duty_ppt = (3·fill_ppt² + 2000·fill_ppt + 4_750_000) / 10_000
+fn gauge_ppt_to_duty_ppt(fill_ppt: u32) -> u16 {
+    // Measured Duty -> Gauge calibration points (fit is imperfect at 75%):
+    // 475 ->   0‰
+    // 540 -> 250‰
+    // 650 -> 500‰
+    // 830 -> 750‰
+    // 975 -> 1000‰
 
-    let pct = pct.min(100);
-    let duty = (3 * pct * pct + 200 * pct + 47_500) / 100;
+    let f = fill_ppt.min(1000);
+    let duty = (3 * f * f + 2000 * f + 4_750_000) / 10_000;
     duty.min(1000) as u16
 }
 
@@ -173,8 +173,7 @@ async fn main(spawner: Spawner) {
     info!("CAN module starting");
 
     spawner.spawn(animate_status_led(r.status_led)).unwrap();
-    spawner.spawn(read_loop(r.adc)).unwrap();
-    spawner.spawn(animate_fuel_gauge(r.fuel_gauge)).unwrap();
+    spawner.spawn(fuel_gauge_loop(r.adc, r.fuel_gauge)).unwrap();
     spawner.spawn(init_can(r.can_bus)).unwrap();
     spawner
         .spawn(init_voltage_gauges(r.voltage_gauges))
@@ -208,32 +207,55 @@ async fn animate_status_led(r: StatusLedResources) {
 }
 
 #[embassy_executor::task]
-async fn read_loop(r: AdcResources) {
-    let i2c = i2c::I2c::new_async(r.i2c, r.scl, r.sda, Irqs, i2c::Config::default());
-    let mut drdy = Input::new(r.drdy, Pull::Up);
-
+async fn fuel_gauge_loop(adc_r: AdcResources, gauge_r: FuelGaugeResources) {
+    // ADC setup
+    let i2c = i2c::I2c::new_async(adc_r.i2c, adc_r.scl, adc_r.sda, Irqs, i2c::Config::default());
+    let mut drdy = Input::new(adc_r.drdy, Pull::Up);
     let mut adc = Ads1x1x::new_ads1115(i2c, ads1x1x::TargetAddr::default());
-    // R1=470Ω, R2=0..68Ω → V_max = 5 × 68/538 = 0.620V → use ±1.024V PGA range
     let _ = adc.set_full_scale_range(FullScaleRange::Within1_024V);
-    // Enable ALERT/RDY as conversion-ready pin.
-    // use_alert_rdy_pin_as_ready() sets the thresholds but skips enabling the
-    // comparator from default config (crate bug), so enable it after.
     let _ = adc.use_alert_rdy_pin_as_ready();
     let _ = adc.set_comparator_queue(ComparatorQueue::One);
 
-    // Voltage divider: V_adc = Vref × R2 / (R1 + R2)
-    // Solving for R2:  R2 = V_adc × R1 / (Vref - V_adc)
+    // Gauge PWM setup
+    const PWM_FREQ_HZ: u32 = 1000;
+    let mut gauge = Pwm::new_output_ab(
+        gauge_r.pwm, gauge_r.hi, gauge_r.lo,
+        resistance_pwm_config(PWM_FREQ_HZ, 0),
+    );
+
+    // Voltage divider: R2 = V × R1 / (Vref - V)
     const R1_MOHMS: i64 = 470_000;
-    const VREF_UV: i64 = 5_000_000; // 5V in µV
+    const VREF_UV: i64 = 5_000_000;
+    const R_MAX_MOHMS: i64 = 68_000 * 2; // two senders, 68Ω each
 
     loop {
-        let v_uv = read_adc(&mut adc, &mut drdy, || ads1x1x::channel::SingleA0)
-            .await
-            .unwrap();
-        let r2_mohms = v_uv * R1_MOHMS / (VREF_UV - v_uv);
-        info!("ADC: V={}uV, R2={}mOhm", v_uv, r2_mohms);
-        // Timer::after(Duration::from_millis(500)).await;
-        yield_now().await;
+        let v0 = read_adc(&mut adc, &mut drdy, || ads1x1x::channel::SingleA0).await;
+        let v1 = read_adc(&mut adc, &mut drdy, || ads1x1x::channel::SingleA1).await;
+
+        let (v0, v1) = match (v0, v1) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                info!("ADC read failed");
+                Timer::after(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        let r0 = if v0 > 0 && v0 < VREF_UV { v0 * R1_MOHMS / (VREF_UV - v0) } else { 0 };
+        let r1 = if v1 > 0 && v1 < VREF_UV { v1 * R1_MOHMS / (VREF_UV - v1) } else { 0 };
+
+        // 0Ω+0Ω = 100% full, 68Ω+68Ω = 0% full. Work in per-mille for resolution.
+        let raw_ppt = ((R_MAX_MOHMS - (r0 + r1)) * 1000 / R_MAX_MOHMS).clamp(0, 1000);
+
+        // Sensors realistically only swing 5..95%; stretch that to 0..100%.
+        const DEADZONE_PPT: i64 = 50; // 5%
+        let fill_ppt =
+            ((raw_ppt - DEADZONE_PPT) * 1000 / (1000 - 2 * DEADZONE_PPT)).clamp(0, 1000) as u32;
+
+        let duty_ppt = gauge_ppt_to_duty_ppt(fill_ppt);
+        gauge.set_config(&resistance_pwm_config(PWM_FREQ_HZ, duty_ppt));
+
+        info!("R0={}mΩ R1={}mΩ raw_ppt={} fill_ppt={}", r0, r1, raw_ppt, fill_ppt);
     }
 }
 
@@ -249,49 +271,9 @@ async fn read_adc<CH: ads1x1x::ChannelId<Adc>>(
             }
             Ok(raw) => {
                 // ±1.024V FSR → 1 LSB = 1024000 µV / 32768 = 31.25 µV
-                let v_uv = raw as i64 * 125 / 4;
-                return Ok(v_uv);
+                return Ok(raw as i64 * 125 / 4);
             }
             Err(nb::Error::Other(e)) => return Err(e),
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn animate_fuel_gauge(r: FuelGaugeResources) {
-    const PWM_FREQ_HZ: u32 = 1000;
-    let mut totem0 = Pwm::new_output_ab(r.pwm, r.hi, r.lo, resistance_pwm_config(PWM_FREQ_HZ, 0));
-
-    const SWEEP_STEPS: u32 = 100;
-    const SWEEP_DURATION_MS: u64 = 4_000;
-    const SWEEP_STEP_MS: u64 = SWEEP_DURATION_MS / SWEEP_STEPS as u64;
-    const HOLD_MS: u64 = 1_000;
-    const RAMP_STEPS: u32 = 25;
-    const RAMP_DURATION_MS: u64 = 500;
-    const RAMP_STEP_MS: u64 = RAMP_DURATION_MS / RAMP_STEPS as u64;
-
-    loop {
-        // Phase 1: continuous sweep 100 → 0
-        for step in 0..=SWEEP_STEPS {
-            let gauge_percent = 100 - (100 * step) / SWEEP_STEPS;
-            let duty_ppt = gauge_pct_to_duty_ppt(gauge_percent);
-            totem0.set_config(&resistance_pwm_config(PWM_FREQ_HZ, duty_ppt));
-            Timer::after(Duration::from_millis(SWEEP_STEP_MS)).await;
-        }
-
-        // Phase 2: hold at 0 % for 1 s, then ramp-and-hold through 25 → 50 → 75 → 100
-        // (smooth 0.5 s interpolation between each level, then 1 s hold)
-        Timer::after(Duration::from_millis(HOLD_MS)).await;
-        let mut prev_pct: u32 = 0;
-        for next_pct in [25u32, 50, 75, 100] {
-            for step in 1..=RAMP_STEPS {
-                let pct = prev_pct + ((next_pct - prev_pct) * step) / RAMP_STEPS;
-                let duty_ppt = gauge_pct_to_duty_ppt(pct);
-                totem0.set_config(&resistance_pwm_config(PWM_FREQ_HZ, duty_ppt));
-                Timer::after(Duration::from_millis(RAMP_STEP_MS)).await;
-            }
-            Timer::after(Duration::from_millis(HOLD_MS)).await;
-            prev_pct = next_pct;
         }
     }
 }

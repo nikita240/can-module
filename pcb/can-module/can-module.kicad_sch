@@ -2391,6 +2391,16 @@
 		)
 		(uuid "b5394b15-87be-4027-892c-379d921603a8")
 	)
+	(text "FIX: THIS RESISTOR IS TOO LOW! PR1 needs to be at least 1V for switchover"
+		(exclude_from_sim no)
+		(at 219.202 68.58 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+		(uuid "c69bfe15-b66a-4bc2-b67f-449a35dc8266")
+	)
 	(junction
 		(at 198.12 50.8)
 		(diameter 0)
